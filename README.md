@@ -36,7 +36,8 @@ The script can:
 
 - repair the extracted Cosmic Overhaul mod files
 - accept the mod as a `.zip`, extracted folder, or direct `data` folder
-- handle the common `modded\data\...` layout automatically
+- detect the correct mod content automatically, including the common `modded\data\...` layout
+- work cleanly even if the mod folder also contains other nested `data` folders
 - optionally build a clean `stack-size only` pack
 - optionally install the repaired mod straight into your game folder
 
@@ -102,6 +103,8 @@ That will:
 - the game `data` folder
 
 If the mod uses a top-level `modded` folder, the script handles that automatically and copies the contents of `modded` into the game root the way a normal manual install would.
+
+If the mod folder also contains other nested `data` folders, the script still prefers the actual mod payload automatically instead of picking the wrong folder.
 
 ## Examples
 
