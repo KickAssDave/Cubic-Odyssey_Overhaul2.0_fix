@@ -86,11 +86,17 @@ function Resolve-DataRoot {
 
     $resolvedPath = (Resolve-Path -LiteralPath $Path).Path
     $dataCandidate = Join-Path $resolvedPath "data"
+    $moddedDataCandidate = Join-Path (Join-Path $resolvedPath "modded") "data"
     $configsUnderRoot = Join-Path $resolvedPath "configs"
     $configsUnderData = Join-Path $dataCandidate "configs"
+    $configsUnderModdedData = Join-Path $moddedDataCandidate "configs"
 
     if (Test-Path -LiteralPath $configsUnderData -PathType Container) {
         return $dataCandidate
+    }
+
+    if (Test-Path -LiteralPath $configsUnderModdedData -PathType Container) {
+        return $moddedDataCandidate
     }
 
      if (Test-Path -LiteralPath $configsUnderRoot -PathType Container) {
@@ -105,6 +111,15 @@ function Resolve-DataRoot {
          } |
          Select-Object -ExpandProperty FullName -Unique
      )
+
+     $preferredCandidates = @(
+         $nestedCandidates |
+         Where-Object { $_ -imatch '[\\/]modded[\\/]data$' }
+     )
+
+     if ($preferredCandidates.Count -eq 1) {
+         return $preferredCandidates[0]
+     }
 
      if ($nestedCandidates.Count -eq 1) {
          return $nestedCandidates[0]
