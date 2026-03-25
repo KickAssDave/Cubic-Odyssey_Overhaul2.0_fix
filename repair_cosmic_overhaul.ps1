@@ -13,7 +13,7 @@ It can patch the extracted mod in place and can also build a separate clean
 "stack-size only" mini-mod from the supplied original game data.
 
 .PARAMETER ModRoot
-Path to the extracted mod folder, or directly to its data folder.
+Path to the mod .zip file, the extracted mod folder, or directly to its data folder.
 
 .PARAMETER OriginalGameRoot
 Path to a clean copy of the game's files, or directly to its data folder.
@@ -21,15 +21,32 @@ Path to a clean copy of the game's files, or directly to its data folder.
 .PARAMETER CreateStackOnlyPack
 Also generates a separate stack-size-only pack based on the clean original files.
 
+.PARAMETER InstallToGameRoot
+Optional path to the actual Cubic Odyssey install folder. If provided, the script copies
+the patched mod contents into the game folder after applying fixes. This accepts either
+the game root folder or the game's data folder.
+
 .PARAMETER StackOnlyOutputRoot
 Output folder for the stack-size-only pack. If omitted, a folder named
 STACK_SIZE_ONLY_999_CLEAN will be created next to the mod folder.
 
 .EXAMPLE
 .\repair_cosmic_overhaul.ps1 `
+  -ModRoot ".\COSMIC OVERHAUL 2.0 MAIN-26-2-0-1752800472.zip" `
+  -OriginalGameRoot ".\ORIGINAL_GAME" `
+  -InstallToGameRoot "D:\SteamLibrary\steamapps\common\Cubic Odyssey"
+
+.EXAMPLE
+.\repair_cosmic_overhaul.ps1 `
   -ModRoot ".\COSMIC OVERHAUL 2.0 MAIN-26-2-0-1752800472" `
   -OriginalGameRoot ".\ORIGINAL_GAME" `
   -CreateStackOnlyPack
+
+.EXAMPLE
+.\repair_cosmic_overhaul.ps1 `
+  -ModRoot ".\COSMIC OVERHAUL 2.0 MAIN-26-2-0-1752800472" `
+  -OriginalGameRoot ".\ORIGINAL_GAME" `
+  -InstallToGameRoot "D:\SteamLibrary\steamapps\common\Cubic Odyssey"
 
 .EXAMPLE
 .\repair_cosmic_overhaul.ps1 `
@@ -48,6 +65,8 @@ param(
 
     [switch]$CreateStackOnlyPack,
 
+    [string]$InstallToGameRoot,
+
     [string]$StackOnlyOutputRoot
 )
 
@@ -56,7 +75,7 @@ $ErrorActionPreference = "Stop"
 
 $script:Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 
- function Resolve-DataRoot {
+function Resolve-DataRoot {
      param(
          [Parameter(Mandatory = $true)]
          [string]$Path,
@@ -98,6 +117,77 @@ $script:Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 
      throw "$Label must point to either a folder that contains a 'data' directory, or directly to a 'data' directory."
  }
+
+function Expand-ModArchiveIfNeeded {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Label
+    )
+
+    $resolvedPath = (Resolve-Path -LiteralPath $Path).Path
+    $item = Get-Item -LiteralPath $resolvedPath
+
+    if ($item.PSIsContainer) {
+        return [pscustomobject]@{
+            WorkingPath = $resolvedPath
+            Extracted   = $false
+            TempRoot    = $null
+        }
+    }
+
+    if ($item.Extension -ine ".zip") {
+        throw "$Label must point to a .zip file, an extracted mod folder, or directly to a data folder."
+    }
+
+    $baseDir = Split-Path -Path $resolvedPath -Parent
+    $zipStem = [System.IO.Path]::GetFileNameWithoutExtension($item.Name)
+    $tempRoot = Join-Path $baseDir ("_repair_tmp_" + $zipStem + "_" + [guid]::NewGuid().ToString("N"))
+    $extractRoot = Join-Path $tempRoot "extracted"
+
+    [void][System.IO.Directory]::CreateDirectory($extractRoot)
+    Expand-Archive -LiteralPath $resolvedPath -DestinationPath $extractRoot -Force
+
+    $directories = @(Get-ChildItem -LiteralPath $extractRoot -Directory)
+    if ($directories.Count -eq 1) {
+        $workingPath = $directories[0].FullName
+    }
+    else {
+        $workingPath = $extractRoot
+    }
+
+    return [pscustomobject]@{
+        WorkingPath = $workingPath
+        Extracted   = $true
+        TempRoot    = $tempRoot
+    }
+}
+
+function Resolve-GameRoot {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Label
+    )
+
+    $resolvedPath = (Resolve-Path -LiteralPath $Path).Path
+    $dataCandidate = Join-Path $resolvedPath "data"
+    $configsUnderRoot = Join-Path $resolvedPath "configs"
+
+    if (Test-Path -LiteralPath $dataCandidate -PathType Container) {
+        return $resolvedPath
+    }
+
+    if (Test-Path -LiteralPath $configsUnderRoot -PathType Container) {
+        return (Split-Path -Path $resolvedPath -Parent)
+    }
+
+    throw "$Label must point to either the game root folder or directly to the game's data folder."
+}
 
 function Read-FileText {
     param(
@@ -357,78 +447,165 @@ function Restore-HiddenItemDefinitions {
     }
 }
 
-$modDataRoot = Resolve-DataRoot -Path $ModRoot -Label "ModRoot"
-$originalDataRoot = Resolve-DataRoot -Path $OriginalGameRoot -Label "OriginalGameRoot"
+function Install-ModContentToGameRoot {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$SourceRoot,
 
-$modConfigsPath = Join-Path $modDataRoot "configs"
-$originalConfigsPath = Join-Path $originalDataRoot "configs"
-$modComponentsPath = Join-Path $modConfigsPath "components"
-$modItemsPath = Join-Path $modConfigsPath "items"
-$originalItemsPath = Join-Path $originalConfigsPath "items"
+        [Parameter(Mandatory = $true)]
+        [string]$TargetGameRoot
+    )
 
-if (-not (Test-Path -LiteralPath $modComponentsPath -PathType Container)) {
-    throw "Could not find the mod components folder: $modComponentsPath"
+    $normalizedSource = [System.IO.Path]::GetFullPath($SourceRoot).TrimEnd('\')
+    $normalizedTarget = [System.IO.Path]::GetFullPath($TargetGameRoot).TrimEnd('\')
+
+    if ($normalizedSource -ieq $normalizedTarget) {
+        return [pscustomobject]@{
+            SourceRoot      = $normalizedSource
+            TargetGameRoot  = $normalizedTarget
+            ItemsCopied     = 0
+            SkippedSamePath = $true
+        }
+    }
+
+    $itemsCopied = 0
+    $topLevelItems = @(Get-ChildItem -LiteralPath $SourceRoot -Force)
+
+    foreach ($item in $topLevelItems) {
+        $destinationPath = Join-Path $TargetGameRoot $item.Name
+        if ($PSCmdlet.ShouldProcess($destinationPath, "Copy patched mod content into game folder")) {
+            if ($item.PSIsContainer -and (Test-Path -LiteralPath $destinationPath -PathType Container)) {
+                foreach ($child in Get-ChildItem -LiteralPath $item.FullName -Force) {
+                    $childDestinationPath = Join-Path $destinationPath $child.Name
+                    Copy-Item -LiteralPath $child.FullName -Destination $childDestinationPath -Recurse -Force
+                }
+            }
+            else {
+                Copy-Item -LiteralPath $item.FullName -Destination $destinationPath -Recurse -Force
+            }
+            $itemsCopied++
+        }
+    }
+
+    return [pscustomobject]@{
+        SourceRoot      = $normalizedSource
+        TargetGameRoot  = $normalizedTarget
+        ItemsCopied     = $itemsCopied
+        SkippedSamePath = $false
+    }
 }
+$modSource = Expand-ModArchiveIfNeeded -Path $ModRoot -Label "ModRoot"
 
-if (-not (Test-Path -LiteralPath $originalItemsPath -PathType Container)) {
-    throw "Could not find the original game items folder: $originalItemsPath"
+try {
+    $modDataRoot = Resolve-DataRoot -Path $modSource.WorkingPath -Label "ModRoot"
+    $originalDataRoot = Resolve-DataRoot -Path $OriginalGameRoot -Label "OriginalGameRoot"
+    $modContentRoot = Split-Path -Path $modDataRoot -Parent
+
+    $modConfigsPath = Join-Path $modDataRoot "configs"
+    $originalConfigsPath = Join-Path $originalDataRoot "configs"
+    $modComponentsPath = Join-Path $modConfigsPath "components"
+    $modItemsPath = Join-Path $modConfigsPath "items"
+    $originalItemsPath = Join-Path $originalConfigsPath "items"
+    $installSummary = $null
+
+    if (-not (Test-Path -LiteralPath $modComponentsPath -PathType Container)) {
+        throw "Could not find the mod components folder: $modComponentsPath"
+    }
+
+    if (-not (Test-Path -LiteralPath $originalItemsPath -PathType Container)) {
+        throw "Could not find the original game items folder: $originalItemsPath"
+    }
+
+     if ($CreateStackOnlyPack.IsPresent -and [string]::IsNullOrWhiteSpace($StackOnlyOutputRoot)) {
+         $modParent = Split-Path -Path (Split-Path -Path $modDataRoot -Parent) -Parent
+         $StackOnlyOutputRoot = Join-Path $modParent "STACK_SIZE_ONLY_999_CLEAN"
+     }
+
+     if ($CreateStackOnlyPack.IsPresent) {
+         $StackOnlyOutputRoot = [System.IO.Path]::GetFullPath($StackOnlyOutputRoot)
+     }
+
+    if (-not [string]::IsNullOrWhiteSpace($InstallToGameRoot)) {
+        $InstallToGameRoot = Resolve-GameRoot -Path $InstallToGameRoot -Label "InstallToGameRoot"
+    }
+
+     Write-Host "Mod data root: $modDataRoot"
+     Write-Host "Mod content root: $modContentRoot"
+     Write-Host "Original data root: $originalDataRoot"
+    if ($modSource.Extracted) {
+        Write-Host "Mod archive extracted to temporary folder: $($modSource.WorkingPath)"
+    }
+    if ($CreateStackOnlyPack.IsPresent) {
+        Write-Host "Stack-only output: $StackOnlyOutputRoot"
+    }
+    if (-not [string]::IsNullOrWhiteSpace($InstallToGameRoot)) {
+        Write-Host "Install target game root: $InstallToGameRoot"
+    }
+
+    $shieldSummary = Update-ShieldComponents -ComponentsPath $modComponentsPath
+    $stackSummary = Expand-ModStackSizes -OriginalItemsPath $originalItemsPath -ModItemsPath $modItemsPath
+    $stackOnlySummary = $null
+    $stackOnlyItemsPath = $null
+
+    if ($CreateStackOnlyPack.IsPresent) {
+        $stackOnlySummary = New-StackOnlyPack -OriginalItemsPath $originalItemsPath -OutputRoot $StackOnlyOutputRoot
+        $stackOnlyItemsPath = Join-Path $StackOnlyOutputRoot "data\configs\items"
+    }
+
+    $hiddenItemSummary = Restore-HiddenItemDefinitions -OriginalItemsPath $originalItemsPath -ModItemsPath $modItemsPath -StackOnlyItemsPath $stackOnlyItemsPath
+
+    if (-not [string]::IsNullOrWhiteSpace($InstallToGameRoot)) {
+        $installSummary = Install-ModContentToGameRoot -SourceRoot $modContentRoot -TargetGameRoot $InstallToGameRoot
+    }
+
+    Write-Host ""
+    Write-Host "Completed."
+    Write-Host "Shield files scanned: $($shieldSummary.Scanned)"
+    Write-Host "Shield files updated: $($shieldSummary.Updated)"
+    Write-Host "Base-game stackable items found: $($stackSummary.Eligible)"
+    Write-Host "Main mod item files created: $($stackSummary.Created)"
+    Write-Host "Main mod item files updated: $($stackSummary.Updated)"
+    Write-Host "Hidden/system item files restored in main mod: $($hiddenItemSummary.MainModFilesRestored)"
+
+    if ($null -ne $stackOnlySummary) {
+        Write-Host "Stack-only pack eligible items: $($stackOnlySummary.Eligible)"
+        Write-Host "Stack-only pack files written: $($stackOnlySummary.FilesWritten)"
+        Write-Host "Hidden/system item files restored in stack-only pack: $($hiddenItemSummary.StackOnlyFilesRestored)"
+    }
+
+    if ($null -ne $installSummary) {
+        Write-Host "Installed top-level mod entries into game root: $($installSummary.ItemsCopied)"
+        if ($installSummary.SkippedSamePath) {
+            Write-Host "Install copy skipped because the mod content root already matches the target game root."
+        }
+    }
+
+    [pscustomobject]@{
+        ModInputPath                 = $ModRoot
+        ModInputWasZip               = $modSource.Extracted
+        ModDataRoot                  = $modDataRoot
+        ModContentRoot               = $modContentRoot
+        OriginalDataRoot             = $originalDataRoot
+        ShieldFilesScanned           = $shieldSummary.Scanned
+        ShieldFilesUpdated           = $shieldSummary.Updated
+        BaseGameStackableItems       = $stackSummary.Eligible
+        MainModItemFilesCreated      = $stackSummary.Created
+        MainModItemFilesUpdated      = $stackSummary.Updated
+        HiddenSystemItemsScanned     = $hiddenItemSummary.HiddenItemsScanned
+        MainModHiddenItemsRestored   = $hiddenItemSummary.MainModFilesRestored
+        StackOnlyPackCreated         = $CreateStackOnlyPack.IsPresent
+        StackOnlyPackOutputRoot      = if ($null -ne $stackOnlySummary) { $stackOnlySummary.OutputRoot } else { $null }
+        StackOnlyPackEligibleItems   = if ($null -ne $stackOnlySummary) { $stackOnlySummary.Eligible } else { 0 }
+        StackOnlyPackFilesWritten    = if ($null -ne $stackOnlySummary) { $stackOnlySummary.FilesWritten } else { 0 }
+        StackOnlyHiddenItemsRestored = if ($null -ne $stackOnlySummary) { $hiddenItemSummary.StackOnlyFilesRestored } else { 0 }
+        InstallTargetGameRoot        = if ($null -ne $installSummary) { $installSummary.TargetGameRoot } else { $null }
+        InstalledTopLevelEntries     = if ($null -ne $installSummary) { $installSummary.ItemsCopied } else { 0 }
+        InstallCopySkippedSamePath   = if ($null -ne $installSummary) { $installSummary.SkippedSamePath } else { $false }
+    }
 }
-
- if ($CreateStackOnlyPack.IsPresent -and [string]::IsNullOrWhiteSpace($StackOnlyOutputRoot)) {
-     $modParent = Split-Path -Path (Split-Path -Path $modDataRoot -Parent) -Parent
-     $StackOnlyOutputRoot = Join-Path $modParent "STACK_SIZE_ONLY_999_CLEAN"
- }
-
- if ($CreateStackOnlyPack.IsPresent) {
-     $StackOnlyOutputRoot = [System.IO.Path]::GetFullPath($StackOnlyOutputRoot)
- }
-
- Write-Host "Mod data root: $modDataRoot"
- Write-Host "Original data root: $originalDataRoot"
-if ($CreateStackOnlyPack.IsPresent) {
-    Write-Host "Stack-only output: $StackOnlyOutputRoot"
-}
-
-$shieldSummary = Update-ShieldComponents -ComponentsPath $modComponentsPath
-$stackSummary = Expand-ModStackSizes -OriginalItemsPath $originalItemsPath -ModItemsPath $modItemsPath
-$stackOnlySummary = $null
-$stackOnlyItemsPath = $null
-
-if ($CreateStackOnlyPack.IsPresent) {
-    $stackOnlySummary = New-StackOnlyPack -OriginalItemsPath $originalItemsPath -OutputRoot $StackOnlyOutputRoot
-    $stackOnlyItemsPath = Join-Path $StackOnlyOutputRoot "data\configs\items"
-}
-
-$hiddenItemSummary = Restore-HiddenItemDefinitions -OriginalItemsPath $originalItemsPath -ModItemsPath $modItemsPath -StackOnlyItemsPath $stackOnlyItemsPath
-
-Write-Host ""
-Write-Host "Completed."
-Write-Host "Shield files scanned: $($shieldSummary.Scanned)"
-Write-Host "Shield files updated: $($shieldSummary.Updated)"
-Write-Host "Base-game stackable items found: $($stackSummary.Eligible)"
-Write-Host "Main mod item files created: $($stackSummary.Created)"
-Write-Host "Main mod item files updated: $($stackSummary.Updated)"
-Write-Host "Hidden/system item files restored in main mod: $($hiddenItemSummary.MainModFilesRestored)"
-
-if ($null -ne $stackOnlySummary) {
-    Write-Host "Stack-only pack eligible items: $($stackOnlySummary.Eligible)"
-    Write-Host "Stack-only pack files written: $($stackOnlySummary.FilesWritten)"
-    Write-Host "Hidden/system item files restored in stack-only pack: $($hiddenItemSummary.StackOnlyFilesRestored)"
-}
-
-[pscustomobject]@{
-    ModDataRoot                 = $modDataRoot
-    OriginalDataRoot            = $originalDataRoot
-    ShieldFilesScanned          = $shieldSummary.Scanned
-    ShieldFilesUpdated          = $shieldSummary.Updated
-    BaseGameStackableItems      = $stackSummary.Eligible
-    MainModItemFilesCreated     = $stackSummary.Created
-    MainModItemFilesUpdated     = $stackSummary.Updated
-    HiddenSystemItemsScanned    = $hiddenItemSummary.HiddenItemsScanned
-    MainModHiddenItemsRestored  = $hiddenItemSummary.MainModFilesRestored
-    StackOnlyPackCreated        = $CreateStackOnlyPack.IsPresent
-    StackOnlyPackOutputRoot     = if ($null -ne $stackOnlySummary) { $stackOnlySummary.OutputRoot } else { $null }
-    StackOnlyPackEligibleItems  = if ($null -ne $stackOnlySummary) { $stackOnlySummary.Eligible } else { 0 }
-    StackOnlyPackFilesWritten   = if ($null -ne $stackOnlySummary) { $stackOnlySummary.FilesWritten } else { 0 }
-    StackOnlyHiddenItemsRestored = if ($null -ne $stackOnlySummary) { $hiddenItemSummary.StackOnlyFilesRestored } else { 0 }
+finally {
+    if ($modSource.Extracted -and -not [string]::IsNullOrWhiteSpace($modSource.TempRoot) -and (Test-Path -LiteralPath $modSource.TempRoot)) {
+        Remove-Item -LiteralPath $modSource.TempRoot -Recurse -Force
+        Write-Host "Temporary extraction folder removed."
+    }
 }
